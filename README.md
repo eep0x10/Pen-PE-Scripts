@@ -5,16 +5,40 @@
 
 ---
 
+## Uso Rápido — Orquestrador
+
+```powershell
+# Análise completa (estática + runtime) com relatório HTML
+.\Invoke-PEAudit.ps1 -ExePath "C:\Program Files\App\app.exe"
+
+# Só análise estática (mais rápido, sem executar o binário)
+.\Invoke-PEAudit.ps1 -ExePath "C:\App\app.exe" -SkipRuntime
+
+# Diretório de output customizado + scan runtime de 30s
+.\Invoke-PEAudit.ps1 -ExePath "C:\App\app.exe" -OutputDir "C:\reports\app" -ScanSeconds 30
+```
+
+O orquestrador executa todos os scripts abaixo em sequência, agrega os resultados e gera um **relatório HTML** com risk matrix, badges por severidade e detalhes por script.
+
+---
+
 ## Scripts
 
-| Script | Vetor | PoC | Runtime |
-|---|---|---|---|
-| `Check-DllHijacking.ps1` | DLL Hijacking (4 vetores) | Sim | Sim |
-| `Check-DllSideloading.ps1` | DLL Sideloading | Sim | Sim |
-| `Check-COMHijacking.ps1` | COM Object Hijacking via HKCU | Sim | Sim (admin) |
-| `Check-PEPlanting.ps1` | Binary Planting / PATH execution | Não | Sim (WMI) |
-| `Audit-PEMitigations.ps1` | Audit de mitigações (ASLR/DEP/CFG/…) | — | — |
-| `Find-HardcodedSecrets.ps1` | Segredos hardcoded / strings de alto valor | — | — |
+| Script | Categoria | PoC | Runtime | JSON |
+|---|---|---|---|---|
+| `Invoke-PEAudit.ps1` | **Orquestrador** | — | — | — |
+| `Audit-PEMitigations.ps1` | Mitigações PE | — | — | Sim |
+| `Check-PEEntropy.ps1` | Packer / Obfuscação | — | — | Sim |
+| `Check-ManifestPrivileges.ps1` | UAC / autoElevate | — | — | Sim |
+| `Find-DangerousImports.ps1` | Mapa de primitivas | — | — | Sim |
+| `Check-AntiAnalysis.ps1` | Anti-debug / Anti-VM | — | — | Sim |
+| `Find-HardcodedSecrets.ps1` | Segredos hardcoded | — | — | Sim |
+| `Check-DllHijacking.ps1` | DLL Hijacking (4 vetores) | Sim | Sim | — |
+| `Check-DllSideloading.ps1` | DLL Sideloading | Sim | Sim | — |
+| `Check-COMHijacking.ps1` | COM Object Hijacking via HKCU | Sim | Sim (admin) | — |
+| `Check-PEPlanting.ps1` | Binary Planting / PATH relativo | — | Sim (WMI) | — |
+| `Check-NamedPipes.ps1` | Named Pipes ACL / Impersonation | — | Sim | Sim |
+| `Check-TempRace.ps1` | TOCTOU / Temp file race | — | Sim | Sim |
 
 ---
 
@@ -205,6 +229,154 @@ Também mapeia cada achado para a **seção PE** de origem (`.rdata`, `.data`, `
 | `-MinLength` | Comprimento mínimo de string (padrão: 6) |
 | `-MinEntropy` | Limiar de entropia para alertar (padrão: 4.5) |
 | `-OutputFile` | Exporta resultados em JSON |
+
+---
+
+## `Find-DangerousImports.ps1`
+
+Categoriza todos os imports por classe de primitiva, gerando um mapa de superfície de ataque em segundos.
+
+| Categoria | Severidade | Exemplos |
+|---|---|---|
+| Buffer Overflow | CRITICAL | `strcpy`, `strcat`, `sprintf`, `gets`, `lstrcpy` |
+| Process Injection | CRITICAL | `VirtualAllocEx` + `WriteProcessMemory` + `CreateRemoteThread` |
+| Privilege Escalation | HIGH | `OpenProcessToken`, `AdjustTokenPrivileges`, `ImpersonateNamedPipeClient` |
+| Memory Manipulation | HIGH | `VirtualProtect`, `NtMapViewOfSection`, `MapViewOfFileEx` |
+| Dynamic Resolution | HIGH | `GetProcAddress`, `LoadLibraryA/W` (pode ocultar APIs perigosas) |
+| Anti-Analysis | MEDIUM | `IsDebuggerPresent`, `NtQueryInformationProcess`, `CreateToolhelp32Snapshot` |
+| UAC / Elevation | HIGH | `ShellExecuteExW`, `CreateProcessAsUserW` |
+| IPC / Named Pipes | MEDIUM | `CreateNamedPipeW`, `ImpersonateNamedPipeClient` |
+
+Detecta também o **injection trinity** (`VirtualAllocEx` + `WriteProcessMemory` + `CreateRemoteThread` presentes simultaneamente).
+
+```powershell
+.\Find-DangerousImports.ps1 -ExePath "C:\App\app.exe"
+.\Find-DangerousImports.ps1 -ExePath "C:\App\app.exe" -JsonOutput "C:\report\imports.json"
+```
+
+---
+
+## `Check-AntiAnalysis.ps1`
+
+Detecta técnicas de evasão de análise. Essencial antes de qualquer análise dinâmica — diz o que precisará ser bypassed.
+
+- **Anti-debug**: `IsDebuggerPresent`, `CheckRemoteDebuggerPresent`, `NtQueryInformationProcess` (ProcessDebugPort)
+- **Timing detection**: múltiplas chamadas a `GetTickCount`/`QueryPerformanceCounter` = timing-based debugger check
+- **Anti-VM strings**: artefatos de VMware, VirtualBox, QEMU, Hyper-V e Parallels em strings
+- **Anti-sandbox**: usernames/hostnames/processos de sandboxes conhecidas (Cuckoo, Anubis, etc.)
+- **Obfuscação de código**: seções executáveis com entropia > 6.5 = strings/código encodados
+
+Gera recomendações de bypass (ScyllaHide, dumping de memória, remoção de artefatos de VM).
+
+```powershell
+.\Check-AntiAnalysis.ps1 -ExePath "C:\sample.exe"
+.\Check-AntiAnalysis.ps1 -ExePath "C:\sample.exe" -JsonOutput "C:\report\antidebug.json"
+```
+
+---
+
+## `Check-ManifestPrivileges.ps1`
+
+Extrai e analisa o manifesto XML embutido no PE (RT_MANIFEST, tipo 24).
+
+| Campo | Risco se verdadeiro |
+|---|---|
+| `autoElevate=true` + `requireAdministrator` | CRITICAL — elevação silenciosa, combine com DLL hijacking = admin sem UAC |
+| `autoElevate=true` | HIGH — UAC bypass carrier via sideloading ou registry hijacking |
+| `uiAccess=true` | HIGH — pode injetar input em janelas elevadas |
+| `requireAdministrator` | MEDIUM — UAC padrão, avaliar paths COM |
+| `highestAvailable` | LOW — condicional ao token do usuário |
+
+Também verifica se o binário está na lista de alvos conhecidos de UAC bypass (`fodhelper.exe`, `eventvwr.exe`, `sdclt.exe`, etc.).
+
+```powershell
+.\Check-ManifestPrivileges.ps1 -ExePath "C:\Windows\System32\fodhelper.exe"
+.\Check-ManifestPrivileges.ps1 -ExePath "C:\App\app.exe" -JsonOutput "C:\report\manifest.json"
+```
+
+---
+
+## `Check-PEEntropy.ps1`
+
+Calcula entropia de Shannon por seção e detecta packers/protectors.
+
+| Entropia | Classificação |
+|---|---|
+| ≥ 7.5 | ENCRYPTED/PACKED (quase certamente comprimido ou cifrado) |
+| ≥ 7.0 | HIGHLY COMPRESSED |
+| ≥ 6.5 | COMPRESSED/OBFUSCATED |
+| ≥ 6.0 | SUSPICIOUS |
+| 3.5–6.0 | Normal code/data |
+
+**Packers detectados por assinatura**: UPX (`UPX0`/`UPX1`), MPRESS (`.MPRESS1`/`.MPRESS2`), ASPack (`.aspack`), PECompact (`.packed`), Petite (`.petite`), NsPack.
+
+**Heurísticas de protector**: import table com ≤2 DLLs + seção executável com entropia > 7.0 = Themida/VMProtect/Enigma.
+
+Detecta também **overlay** (dados após a última seção) — comum em instaladores e droppers.
+
+```powershell
+.\Check-PEEntropy.ps1 -ExePath "C:\sample.exe"
+.\Check-PEEntropy.ps1 -ExePath "C:\packed.exe" -JsonOutput "C:\report\entropy.json"
+```
+
+---
+
+## `Check-NamedPipes.ps1`
+
+Monitora named pipes criados pelo processo e avalia vulnerabilidade de impersonation.
+
+**Como funciona:** snapshot do namespace `\\.\pipe\` antes do launch, monitoramento durante N segundos, diff = pipes criados pelo alvo. Para cada pipe novo: testa conectabilidade como usuário atual, lê ACL, classifica risco.
+
+**Vetor de ataque:** processo elevado cria pipe com `Everyone: Connect` + chama `ImpersonateNamedPipeClient` → cliente low-priv conecta → servidor impersona → token elevado.
+
+```powershell
+.\Check-NamedPipes.ps1 -ExePath "C:\App\service.exe"
+.\Check-NamedPipes.ps1 -ExePath "C:\App\app.exe" -ScanSeconds 30 -JsonOutput "C:\report\pipes.json"
+```
+
+---
+
+## `Check-TempRace.ps1`
+
+Detecta criação de arquivos em caminhos previsíveis sujeitos a TOCTOU e symlink attacks.
+
+**Classificação de previsibilidade:**
+
+| Padrão de nome | Risco | Exemplo |
+|---|---|---|
+| Nome fixo sem componente aleatório | CRITICAL | `install.tmp`, `update.exe` |
+| Baseado em PID | HIGH | `proc_12345.tmp` |
+| Baseado em timestamp | MEDIUM | `log_20240401.tmp` |
+| Hex curto (< 12 chars) | MEDIUM | `tmp_a3f2.tmp` |
+| UUID / hex longo | NONE | `{a1b2c3d4-...}.tmp` |
+
+Combina análise estática (strings com padrões de `%TEMP%\nome_fixo`) com monitoramento runtime via `FileSystemWatcher` em `%TEMP%`, `C:\Windows\Temp` e `%ProgramData%`.
+
+```powershell
+.\Check-TempRace.ps1 -ExePath "C:\App\installer.exe"
+.\Check-TempRace.ps1 -ExePath "C:\App\app.exe" -ScanSeconds 30 -ExtraWatchDirs @("C:\ProgramData") -JsonOutput "C:\report\race.json"
+```
+
+---
+
+## `Invoke-PEAudit.ps1` — Orquestrador
+
+Executa todos os scripts em sequência e gera relatório consolidado.
+
+**Parâmetros:**
+
+| Parâmetro | Descrição |
+|---|---|
+| `-ExePath` | (Obrigatório) Binário a analisar |
+| `-OutputDir` | Diretório para relatório HTML e JSONs (padrão: `.\reports\<nome>_<ts>`) |
+| `-SkipRuntime` | Pula Check-NamedPipes e Check-TempRace |
+| `-SkipDllPoC` | Não gera PoCs de DLL/COM |
+| `-ScanSeconds` | Duração dos scans runtime (padrão: 15s) |
+| `-ScriptsDir` | Diretório dos scripts (padrão: mesmo diretório do orquestrador) |
+
+**Output:**
+- Console: tabela colorida com risco por script e finding principal
+- HTML: relatório completo com risk matrix, badges CRITICAL/HIGH/MEDIUM/LOW, detalhes por script
 
 ---
 
